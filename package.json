@@ -1,0 +1,9 @@
+{
+  "name": "@nons/adapter-qqmusic",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "test": "cargo test --manifest-path Cargo.toml --locked && node --test tests/component.test.mjs"
+  }
+}

@@ -4,7 +4,7 @@ import { resolve, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const project = resolve(dirname(fileURLToPath(import.meta.url)), '..')
-const root = resolve(project, '../..')
+const root = process.env.NONS_ROOT ? resolve(process.env.NONS_ROOT) : resolve(project, '../..')
 const target = resolve(project, 'target')
 const env = { ...process.env, CARGO_TARGET_DIR: target }
 const result = spawnSync(
@@ -80,3 +80,4 @@ await copyFile(
   resolve(bundled, 'adapter.component.wasm')
 )
 console.log(`Built Rust QQ adapter: ${resolve(output, 'adapter.component.wasm')}`)
+

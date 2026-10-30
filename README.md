@@ -25,7 +25,7 @@ Rust 组件构建、模型／密码／协议回归、受控 Host 测试和 Windo
 准备项目要求的 Rust 工具链、`wasm32-unknown-unknown` target 和 cargo-component 0.21.1。在仓库根目录执行：
 
 ```powershell
-node adapters/qqmusic/scripts/build.mjs
+node scripts/build.mjs
 ```
 
 构建使用本目录 Cargo.lock，生成 `dist/adapter.component.wasm`，并将 Component、描述符与许可复制到应用随包资源。正常 Tauri 开发／打包入口调用同一脚本；QQ 构建不再需要 npm 协议包、ComponentizeJS、WAC 或组合密码组件。其他 JS 适配器仍按各自构建要求安装依赖。
@@ -33,9 +33,12 @@ node adapters/qqmusic/scripts/build.mjs
 ## 测试入口
 
 ```powershell
-cargo test --manifest-path adapters/qqmusic/Cargo.toml --locked
-node --test adapters/qqmusic/tests/component.test.mjs
+cargo test --manifest-path Cargo.toml --locked
+node scripts/build.mjs
+node --test tests/component.test.mjs
 ```
+
+推送到 `main` 或提交 Pull Request 会运行 GitHub Actions；推送 `v*` 标签会在 Rust 测试、Component 构建和 Component harness 通过后发布可直接安装的 ZIP 及 SHA-256 校验文件。
 
 Component 测试必须先重新构建 Rust 产物；jco 与 WASIShim 沿用 `packages/wasm-crypto` 的锁定开发工具依赖。Rust 模型单测和受控 Host 测试不能替代真实手机扫码、刷新、音质与播放验收。
 

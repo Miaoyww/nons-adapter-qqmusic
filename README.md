@@ -44,4 +44,8 @@ Component 测试必须先重新构建 Rust 产物；jco 与 WASIShim 沿用 `pac
 
 ## 协议依据与许可
 
-平台协议依据 `@yakult-green-tea/qq-music-api@3.1.4`，保留 [MIT 许可](LICENSE.qq-music-api)。密码算法使用 RustCrypto，MQTT 数据包使用 mqttbytes 编解码，日期使用 time；依赖版本由 Cargo.lock 固定，构建脚本收集 WASM 生产依赖的许可证为 `LICENSE.dependencies`。
+平台协议依据 `@yakult-green-tea/qq-music-api@3.1.4`，保留 [MIT 许可](licenses/qq-music-api/License)。密码算法使用 RustCrypto，MQTT 数据包使用 mqttbytes 编解码，日期使用 time；依赖版本由 Cargo.lock 固定，构建脚本收集 WASM 生产依赖的许可证为 `licenses/dependencies/License`。
+
+## 项目许可证
+
+本项目代码采用 [MIT](License)。qq-music-api 的 MIT 条款保留在 `licenses/qq-music-api/License`，构建依赖告知位于产物的 `licenses/dependencies/License`。

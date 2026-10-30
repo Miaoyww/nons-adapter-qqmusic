@@ -65,19 +65,25 @@ const output = resolve(project, 'dist')
 const bundled = resolve(root, 'app/src-tauri/bundled-adapters/qqmusic')
 await mkdir(output, { recursive: true })
 await mkdir(bundled, { recursive: true })
-await writeFile(resolve(output, 'LICENSE.dependencies'), notices.join('\n\n'))
+await mkdir(resolve(output, 'licenses/dependencies'), { recursive: true })
+await writeFile(resolve(output, 'licenses/dependencies/License'), notices.join('\n\n'))
 await copyFile(wasm, resolve(output, 'adapter.component.wasm'))
 for (const destination of [output, bundled]) {
   await copyFile(resolve(project, 'manifest.json'), resolve(destination, 'manifest.json'))
+  await mkdir(resolve(destination, 'licenses/qq-music-api'), { recursive: true })
   await copyFile(
-    resolve(project, 'LICENSE.qq-music-api'),
-    resolve(destination, 'LICENSE.qq-music-api')
+    resolve(project, 'licenses/qq-music-api/License'),
+    resolve(destination, 'licenses/qq-music-api/License')
   )
 }
-await copyFile(resolve(output, 'LICENSE.dependencies'), resolve(bundled, 'LICENSE.dependencies'))
+await mkdir(resolve(bundled, 'licenses/dependencies'), { recursive: true })
+await copyFile(resolve(output, 'licenses/dependencies/License'), resolve(bundled, 'licenses/dependencies/License'))
 await copyFile(
   resolve(output, 'adapter.component.wasm'),
   resolve(bundled, 'adapter.component.wasm')
 )
 console.log(`Built Rust QQ adapter: ${resolve(output, 'adapter.component.wasm')}`)
 
+
+await writeFile(resolve(bundled, 'License'), await readFile(resolve(project, 'License')))
+await copyFile(resolve(project, 'License'), resolve(output, 'License'))

@@ -1,4 +1,4 @@
-//! QR challenge state and the QQ MQTT v5 protocol over the bounded Host transport.
+//! QR challenge state and the QQ MQTT v5 protocol over the Host transport.
 use super::{credential_from, expiry, raw_rpc, string, HttpClient};
 use crate::{crypto, Error, Event, Host, Result};
 use bytes::BytesMut;
@@ -13,8 +13,15 @@ use serde_json::{json, Value};
 use url::Url;
 
 const WECHAT_APP_ID: &str = "wx48db31d50e334801";
-const MAX_MQTT: usize = 64 * 1024;
-const MAX_EVENTS: usize = 32;
+const MAX_POLL_EVENTS: usize = 32;
+
+fn remaining_until(host: &impl Host, deadline: u64) -> Result<u32> {
+    let remaining = deadline.saturating_sub(host.now_ms());
+    if remaining == 0 {
+        return Err(Error::new("deadlineExceeded", "qr.expired"));
+    }
+    Ok(remaining.min(u32::MAX as u64) as u32)
+}
 
 #[derive(Clone, Copy, PartialEq)]
 enum State {
@@ -114,11 +121,14 @@ impl Login {
             self.create_wechat(host)
         };
         if let Err(error) = &result {
-            self.fail(host, error);
+            if !self.check_expiry(host) {
+                self.fail(host, error);
+            }
         }
         result
     }
     fn create_qq(&mut self, host: &impl Host) -> Result<()> {
+        let timeout_ms = remaining_until(host, self.deadline)?;
         let qr = raw_rpc(
             host,
             &mut self.http,
@@ -128,6 +138,7 @@ impl Login {
             "CreateQRCode",
             json!({"tmeAppID":"qqmusic","ct":11,"cv":14090008}),
             json!({"ct":23,"cv":0}),
+            timeout_ms,
         )?;
         let id = string(&qr["qrcodeID"]);
         let encoded = string(&qr["qrcode"]);
@@ -145,7 +156,7 @@ impl Login {
                 .deadline
                 .min(host.now_ms().saturating_add(ttl.saturating_mul(1000)));
         }
-        let mut mqtt = Mqtt::open(host, &self.identifier)?;
+        let mut mqtt = Mqtt::open(host, &self.identifier, self.deadline)?;
         let pending = std::mem::take(&mut mqtt.pending);
         self.mqtt = Some(mqtt);
         self.state = State::Waiting;
@@ -158,6 +169,7 @@ impl Login {
         self.drain_packets(host)
     }
     fn create_wechat(&mut self, host: &impl Host) -> Result<()> {
+        let timeout_ms = remaining_until(host, self.deadline)?;
         let mut url = Url::parse("https://open.weixin.qq.com/connect/qrconnect")
             .map_err(|_| Error::new("invalidData", "qr.wechat-url"))?;
         url.query_pairs_mut().extend_pairs([
@@ -174,9 +186,14 @@ impl Login {
                 "https://y.qq.com/mediastyle/music_v17/src/css/popup_wechat.css#wechat_redirect",
             ),
         ]);
-        let page =
-            self.wechat_http
-                .request(host, "GET", url.as_str(), Vec::new(), Vec::new(), 10000)?;
+        let page = self.wechat_http.request(
+            host,
+            "GET",
+            url.as_str(),
+            Vec::new(),
+            Vec::new(),
+            timeout_ms,
+        )?;
         let text = std::str::from_utf8(&page.body)
             .map_err(|_| Error::new("invalidData", "qr.wechat-html"))?;
         let id = text
@@ -194,6 +211,7 @@ impl Login {
             .map_err(|_| Error::new("invalidData", "qr.wechat-image-url"))?
             .pop_if_empty()
             .push(id);
+        let timeout_ms = remaining_until(host, self.deadline)?;
         let image = self.wechat_http.request(
             host,
             "GET",
@@ -203,7 +221,7 @@ impl Login {
                 "https://open.weixin.qq.com/connect/qrconnect".into(),
             )],
             Vec::new(),
-            10000,
+            timeout_ms,
         )?;
         let mime = if image.body.starts_with(b"\x89PNG\r\n\x1a\n") {
             "image/png"
@@ -228,6 +246,9 @@ impl Login {
             self.poll_qq(host, budget_ms)
         };
         if let Err(error) = &result {
+            if self.check_expiry(host) {
+                return Ok(());
+            }
             if !matches!(
                 error.code.as_str(),
                 "cancelled" | "staleContext" | "permissionDenied"
@@ -243,6 +264,7 @@ impl Login {
         if self.identifier.is_empty() {
             return Ok(());
         }
+        let timeout_ms = remaining_until(host, self.deadline)?.min(budget_ms.max(1));
         let mut url = Url::parse("https://lp.open.weixin.qq.com/connect/l/qrconnect")
             .map_err(|_| Error::new("invalidData", "qr.wechat-poll-url"))?;
         url.query_pairs_mut()
@@ -254,7 +276,7 @@ impl Login {
             url.as_str(),
             vec![("Referer".into(), "https://open.weixin.qq.com/".into())],
             Vec::new(),
-            budget_ms.max(1).min(1500),
+            timeout_ms,
         );
         let response = match response {
             Ok(value) => {
@@ -303,18 +325,24 @@ impl Login {
     fn poll_qq(&mut self, host: &impl Host, budget_ms: u32) -> Result<()> {
         self.drain_packets(host)?;
         let started = host.now_ms();
-        for _ in 0..MAX_EVENTS {
+        for _ in 0..MAX_POLL_EVENTS {
             if self.terminal() {
                 break;
             }
             self.ping(host)?;
             let elapsed = host.now_ms().saturating_sub(started);
-            let remaining = (budget_ms as u64).saturating_sub(elapsed);
-            let event = host.next_event(remaining.min(25) as u32)?;
+            let remaining = (budget_ms as u64)
+                .saturating_sub(elapsed)
+                .min(self.deadline.saturating_sub(host.now_ms()));
+            if remaining == 0 {
+                self.check_expiry(host);
+                break;
+            }
+            let event = host.next_event(remaining as u32)?;
             match event {
                 Some(event) => self.accept_event(host, event)?,
                 None => {
-                    if remaining == 0 || host.now_ms().saturating_sub(started) >= budget_ms as u64 {
+                    if host.now_ms().saturating_sub(started) >= budget_ms as u64 {
                         break;
                     }
                 }
@@ -360,7 +388,9 @@ impl Login {
             Ok(())
         })();
         if let Err(error) = &result {
-            self.fail(host, error);
+            if !self.check_expiry(host) {
+                self.fail(host, error);
+            }
             if !matches!(
                 error.code.as_str(),
                 "cancelled" | "staleContext" | "permissionDenied"
@@ -399,12 +429,7 @@ impl Login {
             None => return Ok(()),
         };
         let mut publishes = Vec::new();
-        let mut packet_count = 0;
         while let Some(packet) = mqtt.packet()? {
-            packet_count += 1;
-            if packet_count > MAX_EVENTS {
-                return Err(Error::new("rateLimited", "mqtt.event-count"));
-            }
             if let Packet::Publish(publish) = packet {
                 publishes.push(publish);
             }
@@ -465,6 +490,7 @@ impl Login {
         let numeric = id
             .parse::<u64>()
             .map_err(|_| Error::new("invalidData", "credential-payload"))?;
+        let timeout_ms = remaining_until(host, self.deadline)?;
         let exchanged = raw_rpc(
             host,
             &mut self.http,
@@ -474,6 +500,7 @@ impl Login {
             "Login",
             json!({"musicid":numeric,"qrCodeID":self.identifier,"token":token}),
             json!({"tmeLoginType":6}),
+            timeout_ms,
         );
         let credential = match exchanged.and_then(|value| credential_from(value, 6)) {
             Ok(value) => value,
@@ -487,6 +514,7 @@ impl Login {
             }
             Err(_) => {
                 let direct = json!({"musicid":id,"str_musicid":id,"musickey":token,"loginType":6});
+                let timeout_ms = remaining_until(host, self.deadline)?;
                 raw_rpc(
                     host,
                     &mut self.http,
@@ -496,6 +524,7 @@ impl Login {
                     "GetLoginUserInfo",
                     json!({}),
                     json!({}),
+                    timeout_ms,
                 )?;
                 direct
             }
@@ -507,6 +536,7 @@ impl Login {
             return Err(Error::new("invalidData", "credential-payload"));
         }
         self.state = State::Scanned;
+        let timeout_ms = remaining_until(host, self.deadline)?;
         let credential = credential_from(
             raw_rpc(
                 host,
@@ -517,9 +547,11 @@ impl Login {
                 "Login",
                 json!({"code":code,"strAppid":WECHAT_APP_ID}),
                 json!({"tmeLoginType":1}),
+                timeout_ms,
             )?,
             1,
         )?;
+        let timeout_ms = remaining_until(host, self.deadline)?;
         let checked = raw_rpc(
             host,
             &mut self.http,
@@ -529,25 +561,30 @@ impl Login {
             "GetLoginUserInfo",
             json!({}),
             json!({}),
+            timeout_ms,
         );
         let credential = match checked {
             Ok(_) => credential,
-            Err(error) if error.code == "unauthenticated" => credential_from(
-                raw_rpc(
-                    host,
-                    &mut self.http,
-                    &self.device,
-                    Some(&credential),
-                    "music.login.LoginServer",
-                    "Login",
-                    json!({
+            Err(error) if error.code == "unauthenticated" => {
+                let timeout_ms = remaining_until(host, self.deadline)?;
+                credential_from(
+                    raw_rpc(
+                        host,
+                        &mut self.http,
+                        &self.device,
+                        Some(&credential),
+                        "music.login.LoginServer",
+                        "Login",
+                        json!({
                 "openid":string(&credential["openid"]),"refresh_token":string(&credential["refresh_token"]),
                 "str_musicid":super::music_id(&credential),"musickey":credential["musickey"],"unionid":string(&credential["unionid"]),
                 "refresh_key":string(&credential["refresh_key"]),"loginMode":2}),
-                    json!({"tmeLoginType":1}),
-                )?,
-                1,
-            )?,
+                        json!({"tmeLoginType":1}),
+                        timeout_ms,
+                    )?,
+                    1,
+                )?
+            }
             Err(error) => return Err(error),
         };
         self.issue(host, credential)
@@ -571,10 +608,12 @@ struct Mqtt {
     last_ping: u64,
 }
 impl Mqtt {
-    fn open(host: &impl Host, id: &str) -> Result<Self> {
+    fn open(host: &impl Host, id: &str, deadline: u64) -> Result<Self> {
         let mut path = "/ws/handshake".to_string();
         for redirect in 0..=3 {
-            let socket = host.websocket_open(&format!("wss://mu.y.qq.com{path}"), "mqtt", 15000)?;
+            let timeout_ms = remaining_until(host, deadline)?;
+            let socket =
+                host.websocket_open(&format!("wss://mu.y.qq.com{path}"), "mqtt", timeout_ms)?;
             let mut mqtt = Self {
                 socket,
                 buffer: BytesMut::new(),
@@ -611,8 +650,9 @@ impl Mqtt {
                     .write(&mut bytes)
                     .map_err(|_| Error::new("invalidData", "mqtt.connect-encode"))?;
                 host.websocket_send(socket, &bytes)?;
+                let timeout_ms = remaining_until(host, deadline)?;
                 let packet = mqtt
-                    .next(host, 20000)?
+                    .next(host, timeout_ms)?
                     .ok_or_else(|| Error::new("deadlineExceeded", "mqtt.connack-timeout"))?;
                 match packet {
                     Packet::ConnAck(ack) if ack.code == ConnectReturnCode::Success => Ok(None),
@@ -636,7 +676,7 @@ impl Mqtt {
             })();
             match opened {
                 Ok(None) => {
-                    let subscription = mqtt.subscribe(host, id);
+                    let subscription = mqtt.subscribe(host, id, deadline);
                     if let Err(error) = subscription {
                         let _ = host.websocket_close(socket);
                         return Err(error);
@@ -649,8 +689,7 @@ impl Mqtt {
                         return Err(Error::new("sourceUnavailable", "mqtt.redirect-limit"));
                     }
                     // The protocol's reference is a path segment on the same authorized broker.
-                    if reference.len() > 1024
-                        || reference.chars().any(|ch| matches!(ch, '?' | '#' | '\\'))
+                    if reference.chars().any(|ch| matches!(ch, '?' | '#' | '\\'))
                         || reference.starts_with('/')
                     {
                         return Err(Error::new("invalidData", "mqtt.redirect-reference"));
@@ -660,7 +699,7 @@ impl Mqtt {
                         .split('/')
                         .map(str::to_owned)
                         .collect::<Vec<_>>();
-                    if pieces.last().map_or(false, |part| part.contains(':')) {
+                    if pieces.last().is_some_and(|part| part.contains(':')) {
                         pieces.pop();
                     }
                     pieces.push(reference);
@@ -674,7 +713,7 @@ impl Mqtt {
         }
         Err(Error::new("sourceUnavailable", "mqtt.redirect-limit"))
     }
-    fn subscribe(&mut self, host: &impl Host, id: &str) -> Result<()> {
+    fn subscribe(&mut self, host: &impl Host, id: &str, deadline: u64) -> Result<()> {
         let mut subscribe =
             Subscribe::new(format!("management.qrcode_login/{id}"), QoS::AtMostOnce);
         subscribe.pkid = 1;
@@ -690,13 +729,9 @@ impl Mqtt {
             .write(&mut bytes)
             .map_err(|_| Error::new("invalidData", "mqtt.subscribe-encode"))?;
         host.websocket_send(self.socket, &bytes)?;
-        let started = host.now_ms();
-        for _ in 0..MAX_EVENTS {
-            let remaining = 20_000_u64.saturating_sub(host.now_ms().saturating_sub(started));
-            if remaining == 0 {
-                return Err(Error::new("deadlineExceeded", "mqtt.suback-timeout"));
-            }
-            match self.next(host, remaining as u32)? {
+        loop {
+            let timeout_ms = remaining_until(host, deadline)?;
+            match self.next(host, timeout_ms)? {
                 Some(Packet::SubAck(ack))
                     if ack.pkid == 1
                         && !ack.return_codes.is_empty()
@@ -708,16 +743,12 @@ impl Mqtt {
                     return Err(Error::new("sourceUnavailable", "mqtt.suback"))
                 }
                 Some(Packet::Publish(publish)) => {
-                    if self.pending.len() >= MAX_EVENTS {
-                        return Err(Error::new("rateLimited", "mqtt.event-count"));
-                    }
                     self.pending.push(publish);
                 }
                 Some(_) => {}
                 None => return Err(Error::new("deadlineExceeded", "mqtt.suback-timeout")),
             }
         }
-        Err(Error::new("rateLimited", "mqtt.handshake-count"))
     }
     fn next(&mut self, host: &impl Host, timeout_ms: u32) -> Result<Option<Packet>> {
         let started = host.now_ms();
@@ -725,19 +756,26 @@ impl Mqtt {
             if let Some(packet) = self.packet()? {
                 return Ok(Some(packet));
             }
-            let remaining =
-                (timeout_ms as u64).saturating_sub(host.now_ms().saturating_sub(started));
-            if remaining == 0 {
-                return Ok(None);
-            }
-            match host.next_event(remaining.min(1000) as u32)? {
+            let remaining = if timeout_ms == 0 {
+                0
+            } else {
+                let remaining =
+                    (timeout_ms as u64).saturating_sub(host.now_ms().saturating_sub(started));
+                if remaining == 0 {
+                    return Ok(None);
+                }
+                remaining as u32
+            };
+            match host.next_event(remaining)? {
                 Some(Event::Binary { socket, data }) if socket == self.socket => {
                     self.feed(&data)?
                 }
                 Some(Event::Closed(socket)) if socket == self.socket => {
                     return Err(Error::new("network", "mqtt.closed"))
                 }
-                None if host.now_ms().saturating_sub(started) >= timeout_ms as u64 => {
+                None if timeout_ms > 0
+                    && host.now_ms().saturating_sub(started) >= timeout_ms as u64 =>
+                {
                     return Ok(None)
                 }
                 _ => {}
@@ -745,14 +783,11 @@ impl Mqtt {
         }
     }
     fn feed(&mut self, data: &[u8]) -> Result<()> {
-        if self.buffer.len().saturating_add(data.len()) > MAX_MQTT {
-            return Err(Error::new("invalidData", "mqtt.buffer-size"));
-        }
         self.buffer.extend_from_slice(data);
         Ok(())
     }
     fn packet(&mut self) -> Result<Option<Packet>> {
-        match v5::read(&mut self.buffer, MAX_MQTT) {
+        match v5::read(&mut self.buffer, 268_435_455) {
             Ok(packet) => Ok(Some(packet)),
             Err(mqttbytes::Error::InsufficientBytes(_)) => Ok(None),
             Err(_) => Err(Error::new("invalidData", "mqtt.packet")),

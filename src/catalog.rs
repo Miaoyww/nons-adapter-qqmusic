@@ -25,7 +25,8 @@ fn send(host: &impl Host, body: Value) -> Result<Value> {
             ("User-Agent".into(), "okhttp/3.14.9".into()),
         ],
         body.to_string().into_bytes(),
-        10000,
+        true,
+        0,
     )?;
     if !(200..300).contains(&response.status) {
         return Err(Error::new(
@@ -122,7 +123,8 @@ fn album(host: &impl Host, id: &str) -> Result<Value> {
         &url,
         vec![("Referer".into(), "https://y.qq.com/".into())],
         vec![],
-        10000,
+        true,
+        0,
     )?;
     if !(200..300).contains(&response.status) {
         return Err(Error::new("network", "catalog.validation"));
@@ -264,15 +266,15 @@ fn tracks_response(
                 let Some(id) = positive_id(first(original, &["id", "songid"])) else {
                     return Err(error);
                 };
-                if !repaired.contains_key(&id) {
-                    let result =
-                        song(host, auth, &format!("id:{id}")).and_then(|v| track(&v, None));
+                if let std::collections::hash_map::Entry::Vacant(entry) = repaired.entry(id) {
+                    let result = song(host, auth, &format!("id:{}", entry.key()))
+                        .and_then(|v| track(&v, None));
                     let result = match result {
                         Ok(v) => Some(v),
                         Err(e) if e.code == "notFound" || e.stage == "track.mid" => None,
                         Err(e) => return Err(e),
                     };
-                    repaired.insert(id, result);
+                    entry.insert(result);
                 }
                 tracks.push(match &repaired[&id] {
                     Some(v) => v.clone(),
@@ -641,7 +643,8 @@ pub fn resolve_playback(host: &impl Host, auth: &mut Auth, request: &Value) -> R
             &url,
             vec![("Accept-Encoding".into(), "identity".into())],
             vec![],
-            10000,
+            true,
+            0,
         )?;
         if response.status != 200 {
             rejected = Error::new(
@@ -656,6 +659,14 @@ pub fn resolve_playback(host: &impl Host, auth: &mut Auth, request: &Value) -> R
             );
             continue;
         }
+        let final_url = response.url;
+        let final_parsed =
+            url::Url::parse(&final_url).map_err(|_| Error::new("invalidData", "playback.url"))?;
+        let final_filename = final_parsed.path().rsplit('/').next().unwrap_or("");
+        if !final_filename.starts_with(prefix) || !final_filename.ends_with(extension) {
+            rejected = Error::new("invalidData", "playback.filename");
+            continue;
+        }
         let actual = response
             .headers
             .iter()
@@ -666,7 +677,7 @@ pub fn resolve_playback(host: &impl Host, auth: &mut Auth, request: &Value) -> R
             continue;
         }
         return Ok(
-            json!({"metadata":{"actualQuality":quality,"extent":{"kind":"full"},"expiresAtMs":null},"url":url,"headers":[]}),
+            json!({"metadata":{"actualQuality":quality,"extent":{"kind":"full"},"expiresAtMs":null},"url":final_url,"headers":[]}),
         );
     }
     Err(rejected)
@@ -746,8 +757,8 @@ fn playback_url(
         return Ok(None);
     }
     Ok(Some(format!(
-        "{}{}",
+        "{}/{}",
         base.trim_end_matches('/'),
-        format!("/{}", purl.trim_start_matches('/'))
+        purl.trim_start_matches('/')
     )))
 }

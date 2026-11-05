@@ -231,7 +231,7 @@ pub fn page_state(page: &Value, scope: String) -> Result<Page> {
         let o = cursor["offset"].as_u64();
         if cursor["scope"] != scope
             || cursor["limit"].as_u64() != Some(limit as u64)
-            || !o.is_some_and(|o| o <= 100000)
+            || o.is_none_or(|o| o > 100000)
         {
             return Err(Error::new("invalidData", "page.cursor-scope"));
         }

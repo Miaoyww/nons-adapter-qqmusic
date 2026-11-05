@@ -279,7 +279,8 @@ fn ensure_qimei(host: &impl Host, device: &mut Value) -> Result<()> {
             QIMEI_URL,
             headers,
             body.to_string().into_bytes(),
-            10_000,
+            true,
+            0,
         )?,
         "qimei.response",
     )?;
@@ -367,7 +368,8 @@ pub fn prepare(host: &impl Host) -> Result<Value> {
                 ),
             ],
             body.to_string().into_bytes(),
-            10_000,
+            true,
+            0,
         )?,
         "session-bootstrap.response",
     )?;

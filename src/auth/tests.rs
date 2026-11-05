@@ -20,9 +20,11 @@ impl Host for Fixture {
         _: &str,
         _: Vec<(String, String)>,
         _: Vec<u8>,
+        _: bool,
         _: u32,
     ) -> Result<Response> {
         Ok(Response {
+            url: "https://example.org/".into(),
             status: 200,
             headers: vec![],
             body: self.response.to_string().into_bytes(),
@@ -79,6 +81,7 @@ fn numeric_protocol_rpc_string_rejection_is_not_success() {
         "read",
         json!({}),
         json!({}),
+        0,
     );
     assert_eq!(result.unwrap_err().code, "unauthenticated");
 }
@@ -96,6 +99,7 @@ fn numeric_protocol_root_string_rejection_is_not_success() {
         "read",
         json!({}),
         json!({}),
+        0,
     );
     assert_eq!(result.unwrap_err().code, "sourceUnavailable");
 }
@@ -119,6 +123,7 @@ fn numeric_protocol_zero_strings_and_omitted_codes_allow_valid_data() {
             "read",
             json!({}),
             json!({}),
+            0,
         )
         .unwrap();
         assert_eq!(result["result"], 1);
@@ -143,6 +148,7 @@ fn numeric_protocol_malformed_error_codes_are_not_success() {
             "read",
             json!({}),
             json!({}),
+            0,
         );
         assert!(result.is_err(), "malformed error code accepted");
     }

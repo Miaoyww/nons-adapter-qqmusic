@@ -152,22 +152,18 @@ fn cbc_rejects_invalid_key_iv_and_padding() {
 }
 
 #[test]
-fn bounded_primitives_enforce_combined_input_and_hkdf_output_limits() {
-    let oversized = vec![0; MAX_INPUT + 1];
-    assert_error(hmac_sha256(&[], &oversized), "crypto.input-size");
-    assert_error(hmac_sha256(&[1], &vec![0; MAX_INPUT]), "crypto.input-size");
-    assert_error(hkdf_sha256(&[1], &[], &oversized, 32), "crypto.input-size");
+fn crypto_primitives_keep_protocol_and_hkdf_output_limits() {
+    let large = vec![0; 1024 * 1024];
+    assert_eq!(hmac_sha256(&[1], &large).unwrap().len(), 32);
     assert_error(hkdf_sha256(&[1], &[], &[], 0), "crypto.hkdf-length");
     assert_error(hkdf_sha256(&[1], &[], &[], 8161), "crypto.hkdf-length");
     assert_eq!(hkdf_sha256(&[1], &[], &[], 8160).unwrap().len(), 8160);
-    assert_error(
-        aes_cbc_encrypt(&[7; 32], &[3; 16], &oversized),
-        "crypto.input-size",
-    );
-    assert_error(
-        aes_gcm_encrypt(&[7; 32], &[3; 12], &[], &vec![0; MAX_INPUT]),
-        "crypto.input-size",
-    );
+    assert!(!aes_cbc_encrypt(&[7; 32], &[3; 16], &large)
+        .unwrap()
+        .is_empty());
+    assert!(!aes_gcm_encrypt(&[7; 32], &[3; 12], &[], &large)
+        .unwrap()
+        .is_empty());
 }
 
 #[test]
@@ -179,11 +175,14 @@ fn protocol_hex_and_base64_encoding_have_fixed_vectors_and_reject_invalid_text()
     for value in ["0", "gg", "é"] {
         assert_error(decode_hex(value), "crypto.hex");
     }
-    assert_error(decode_hex(&"00".repeat(MAX_INPUT + 1)), "crypto.hex");
+    assert_eq!(
+        decode_hex(&"00".repeat(1024 * 1024)).unwrap().len(),
+        1024 * 1024
+    );
     assert_error(decode_b64("!!!!"), "crypto.base64");
-    assert_error(
-        decode_b64(&"A".repeat((MAX_INPUT + 2) / 3 * 4 + 1)),
-        "crypto.base64-size",
+    assert_eq!(
+        decode_b64(&"A".repeat(1024 * 1024)).unwrap().len(),
+        768 * 1024
     );
 }
 
@@ -198,6 +197,7 @@ impl Host for EntropyHost {
         _: &str,
         _: Vec<(String, String)>,
         _: Vec<u8>,
+        _: bool,
         _: u32,
     ) -> Result<Response> {
         panic!("crypto must not access HTTP")

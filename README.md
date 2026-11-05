@@ -18,7 +18,9 @@ Rust 组件构建、模型／密码／协议回归、受控 Host 测试和 Windo
 
 账号与不透明凭据统一交给 AccountManager；设备状态写入适配器专属 Host 分区，保存时剔除 `session*` 字段。曲目 MID、数字歌曲 ID 和音频 media ID 分开处理；缺少 MID 的目录曲目按数字 ID 补全，明确不存在的曲目保留不可用占位。游标绑定请求和页大小。
 
-播放仅接受已识别的明文音质前缀与扩展名，并以曲目目录中的完整大小核对资源 HEAD。拒绝试听、未知完整性、加密文件和禁止的音质降级。播放地址与凭据不进入公开元数据或诊断正文；缓存与失效沿用宿主规则。
+组件导入 `nons:host/transport@1.1.0`。Manifest 不再声明网络主机，HTTP／WebSocket 目标不受主机、IP、端口、URL 凭证或私网限制。通用 HTTP 以 `timeout-ms = 0` 不设期限，登录流程向 HTTP、WebSocket 连接和 MQTT 握手透传二维码协议剩余期限。HTTP 由适配器逐跳跟随，以 URL 集合检测循环并保留每跳 `Set-Cookie`；Cookie jar 不设总量上限，按来源域、Domain、Path 与 Secure 约束回放，播放 HEAD 的最终 URL 才进入交付结果。Host WebSocket 不支持重定向，MQTT 握手的服务器引用仍在同一 endpoint 下最多跟随三次。消息／帧不设固定字节上限，由 Host 队列实施背压。
+
+JSON transport 不设固定 64KiB 上限；RustCrypto 包装也不再限制固定消息大小，只保留算法自身边界。播放仅接受已识别的明文音质前缀与扩展名，并以曲目目录中的完整大小核对最终资源 HEAD。拒绝试听、未知完整性、加密文件和禁止的音质降级。平台分页、签名、音质与 HKDF／RSA 参数限制继续保留；MQTT 每次短轮询最多处理 32 个事件后让出调度，SUBACK 前的累计消息和同一 WebSocket 帧内的包数量不受 32 限制。播放地址与凭据不进入公开元数据或诊断正文；缓存与失效沿用宿主规则。
 
 ## 构建
 
@@ -33,12 +35,13 @@ node scripts/build.mjs
 ## 测试入口
 
 ```powershell
+npm ci --ignore-scripts
 cargo test --manifest-path Cargo.toml --locked
 node scripts/build.mjs
 node --test tests/component.test.mjs
 ```
 
-推送到 `main` 或提交 Pull Request 会运行 GitHub Actions；推送 `v*` 标签会在 Rust 测试、Component 构建和 Component harness 通过后发布可直接安装的 ZIP 及 SHA-256 校验文件。
+适配器自身没有 npm 依赖，`package-lock.json` 仍保持可由 `npm ci` 复现；Rust 依赖由 `Cargo.lock` 和 `--locked` 固定。推送到 `main` 或提交 Pull Request 会运行 GitHub Actions；推送 `v*` 标签会在 Rust 测试、Component 构建和 Component harness 通过后发布可直接安装的 ZIP 及 SHA-256 校验文件。
 
 Component 测试必须先重新构建 Rust 产物；jco 与 WASIShim 沿用 `packages/wasm-crypto` 的锁定开发工具依赖。Rust 模型单测和受控 Host 测试不能替代真实手机扫码、刷新、音质与播放验收。
 

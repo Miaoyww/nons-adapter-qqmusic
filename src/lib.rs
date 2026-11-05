@@ -11,7 +11,6 @@ mod component;
 use serde_json::{json, Value};
 
 pub type Result<T> = std::result::Result<T, Error>;
-pub const MAX_JSON: usize = 64 * 1024;
 
 /// Only stable codes and static protocol stages cross the diagnostic boundary.
 #[derive(Clone, Debug)]
@@ -55,6 +54,7 @@ impl Error {
         )
     }
 }
+
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{} ({})", self.code, self.stage)
@@ -63,6 +63,7 @@ impl std::fmt::Display for Error {
 impl std::error::Error for Error {}
 
 pub struct Response {
+    pub url: String,
     pub status: u16,
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
@@ -80,6 +81,7 @@ pub trait Host {
         url: &str,
         headers: Vec<(String, String)>,
         body: Vec<u8>,
+        follow_redirects: bool,
         timeout_ms: u32,
     ) -> Result<Response>;
     fn now_ms(&self) -> u64;
@@ -106,13 +108,9 @@ impl Adapter {
         self.auth.shutdown(host);
     }
     pub fn call(&mut self, host: &impl Host, method: &str, args: &str) -> String {
-        let result = self.dispatch(host, method, args).and_then(|value| {
-            let encoded = json!({"status":"ok","data":value}).to_string();
-            if encoded.len() > MAX_JSON {
-                return Err(Error::new("invalidData", "transport.reply-size"));
-            }
-            Ok(encoded)
-        });
+        let result = self
+            .dispatch(host, method, args)
+            .map(|value| json!({"status":"ok","data":value}).to_string());
         match result {
             Ok(encoded) => encoded,
             Err(error) => {
@@ -122,9 +120,6 @@ impl Adapter {
         }
     }
     fn dispatch(&mut self, host: &impl Host, method: &str, args: &str) -> Result<Value> {
-        if args.len() > MAX_JSON {
-            return Err(Error::new("invalidData", "transport.args-size"));
-        }
         if method == "music.descriptor" {
             let manifest: Value = serde_json::from_str(include_str!("../manifest.json"))
                 .map_err(|_| Error::new("invalidData", "descriptor.json"))?;

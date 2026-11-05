@@ -6,7 +6,7 @@ pub(crate) mod tests;
 
 use crate::{device, model, Error, Host, Response, Result};
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use url::Url;
 
 const MUSICU: &str = "https://u.y.qq.com/cgi-bin/musicu.fcg";
@@ -62,7 +62,7 @@ impl Auth {
         }
         let result: Result<login::Login> = (|| {
             let device = device::prepare(host)?;
-            Ok(login::Login::new(host, method, device)?)
+            login::Login::new(host, method, device)
         })();
         match result {
             Ok(login) => {
@@ -214,6 +214,7 @@ impl Auth {
                 "str_musicid":music_id(credential),"musicid":credential["musicid"],"musickey":credential["musickey"],
                 "unionid":string(&credential["unionid"]),"refresh_key":string(&credential["refresh_key"]),"loginMode":2}),
             json!({"tmeLoginType":credential["loginType"]}),
+            0,
         );
         let next = match result {
             Ok(value) => credential_from(value, credential["loginType"].as_i64().unwrap_or(6))?,
@@ -255,6 +256,7 @@ impl Auth {
                 method,
                 param,
                 json!({}),
+                0,
             )
         })
     }
@@ -311,7 +313,7 @@ impl Auth {
                     ("Cookie".into(), credential_cookie(&session["credential"])),
                 ],
                 Vec::new(),
-                10000,
+                0,
             )?;
             let body = response_json(&response, "albums.json")?;
             let code = model::safe_integer(&body["code"])
@@ -503,7 +505,8 @@ impl Auth {
                     ("Range".into(), "bytes=0-262143".into()),
                 ],
                 Vec::new(),
-                5000,
+                true,
+                0,
             );
             match response {
                 Ok(response)
@@ -513,7 +516,7 @@ impl Auth {
                 {
                     let rate = response.body.len() as f64
                         / host.now_ms().saturating_sub(started).max(1) as f64;
-                    if fastest.as_ref().map_or(true, |(_, best)| rate > *best) {
+                    if fastest.as_ref().is_none_or(|(_, best)| rate > *best) {
                         fastest = Some((base.clone(), rate));
                     }
                 }
@@ -561,10 +564,10 @@ fn valid_session(value: &Value) -> bool {
         && !string(&value["credential"]["musicid"]).is_empty()
         && value["credential"]["musickey"]
             .as_str()
-            .map_or(false, |v| !v.is_empty())
+            .is_some_and(|v| !v.is_empty())
         && value["credential"]["loginType"].is_number()
         && device::is_valid(&value["device"])
-        && value["expiresAt"].as_f64().map_or(false, f64::is_finite)
+        && value["expiresAt"].as_f64().is_some_and(f64::is_finite)
 }
 fn expiry(credential: &Value, now: u64) -> u64 {
     match (
@@ -665,6 +668,7 @@ fn profile_raw(host: &impl Host, http: &mut HttpClient, session: &Value) -> Resu
         "GetLoginUserInfo",
         json!({}),
         json!({}),
+        0,
     )?;
     if let Some(fields) = public_value(user).as_object() {
         for (key, value) in fields {
@@ -673,6 +677,7 @@ fn profile_raw(host: &impl Host, http: &mut HttpClient, session: &Value) -> Resu
     }
     Ok(profile)
 }
+#[allow(clippy::too_many_arguments)]
 fn raw_rpc(
     host: &impl Host,
     http: &mut HttpClient,
@@ -682,6 +687,7 @@ fn raw_rpc(
     method: &str,
     param: Value,
     overrides: Value,
+    timeout_ms: u32,
 ) -> Result<Value> {
     let mut headers = vec![
         ("Content-Type".into(), "application/json".into()),
@@ -700,7 +706,7 @@ fn raw_rpc(
         MUSICU,
         headers,
         payload.to_string().into_bytes(),
-        10000,
+        timeout_ms,
     )?;
     let value = response_json(&response, "rpc.json")?;
     let global = model::safe_integer(&value["code"])
@@ -727,14 +733,179 @@ fn raw_rpc(
     })
 }
 
+fn valid_cookie_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'!' | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'\''
+                        | b'*'
+                        | b'+'
+                        | b'-'
+                        | b'.'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'|'
+                        | b'~'
+                )
+        })
+}
+
+fn valid_cookie_value(value: &str) -> bool {
+    value
+        .bytes()
+        .all(|byte| byte.is_ascii_graphic() && !matches!(byte, b';' | b',' | b'"' | b'\\'))
+}
+
+fn default_cookie_path(url: &Url) -> String {
+    let path = url.path();
+    if !path.starts_with('/') {
+        return "/".into();
+    }
+    match path.rfind('/') {
+        Some(0) | None => "/".into(),
+        Some(end) => path[..end].to_owned(),
+    }
+}
+
+fn cookie_domain_matches(host: &str, cookie: &StoredCookie) -> bool {
+    host == cookie.domain
+        || (!cookie.host_only
+            && host.len() > cookie.domain.len()
+            && host.ends_with(&cookie.domain)
+            && host.as_bytes()[host.len() - cookie.domain.len() - 1] == b'.')
+}
+
+fn cookie_path_matches(request: &str, cookie: &str) -> bool {
+    request == cookie
+        || (request.starts_with(cookie)
+            && (cookie.ends_with('/') || request.as_bytes().get(cookie.len()) == Some(&b'/')))
+}
+
 /// A jar is private to one protocol client; WeChat and musicu use separate clients.
 #[derive(Default)]
 struct HttpClient {
-    cookies: BTreeMap<String, String>,
+    cookies: BTreeMap<(String, String, String), StoredCookie>,
+}
+struct StoredCookie {
+    value: String,
+    domain: String,
+    host_only: bool,
+    path: String,
+    secure: bool,
 }
 impl HttpClient {
     fn clear(&mut self) {
         self.cookies.clear();
+    }
+    fn request_cookies<'a>(
+        &'a self,
+        url: &'a Url,
+    ) -> impl Iterator<Item = (&'a str, &'a str)> + 'a {
+        let host = url.host_str().unwrap_or("").to_ascii_lowercase();
+        let path = url.path();
+        let secure = url.scheme() == "https";
+        self.cookies
+            .iter()
+            .filter(move |(_, cookie)| {
+                cookie_domain_matches(&host, cookie)
+                    && cookie_path_matches(path, &cookie.path)
+                    && (secure || !cookie.secure)
+            })
+            .map(|((_, _, name), cookie)| (name.as_str(), cookie.value.as_str()))
+    }
+    fn set_cookie(&mut self, url: &Url, value: &str) -> Result<()> {
+        let mut pieces = value.split(';');
+        let (name, value) = pieces
+            .next()
+            .and_then(|pair| pair.split_once('='))
+            .map(|(name, value)| (name.trim(), value.trim()))
+            .ok_or_else(|| Error::new("invalidData", "http.cookie"))?;
+        if !valid_cookie_name(name) || !valid_cookie_value(value) {
+            return Err(Error::new("invalidData", "http.cookie"));
+        }
+        let source = url
+            .host_str()
+            .ok_or_else(|| Error::new("invalidData", "http.cookie-host"))?
+            .to_ascii_lowercase();
+        let mut domain = source.clone();
+        let mut host_only = true;
+        let mut path = default_cookie_path(url);
+        let mut secure = false;
+        let mut expired = false;
+        for attribute in pieces {
+            let (key, value) = attribute
+                .split_once('=')
+                .map(|(key, value)| (key.trim(), value.trim()))
+                .unwrap_or((attribute.trim(), ""));
+            match key.to_ascii_lowercase().as_str() {
+                "domain" => {
+                    let candidate = value.trim_start_matches('.').to_ascii_lowercase();
+                    if candidate.is_empty()
+                        || !(source == candidate || source.ends_with(&format!(".{candidate}")))
+                    {
+                        continue;
+                    }
+                    domain = candidate;
+                    host_only = false;
+                }
+                "path" if value.starts_with('/') => path = value.to_owned(),
+                "secure" => secure = true,
+                "max-age" if value.parse::<i64>().is_ok_and(|seconds| seconds <= 0) => {
+                    expired = true
+                }
+                _ => {}
+            }
+        }
+        let key = (domain.clone(), path.clone(), name.to_owned());
+        if expired {
+            self.cookies.remove(&key);
+        } else {
+            self.cookies.insert(
+                key,
+                StoredCookie {
+                    value: value.to_owned(),
+                    domain,
+                    host_only,
+                    path,
+                    secure,
+                },
+            );
+        }
+        Ok(())
+    }
+    fn set_explicit_cookie(&mut self, url: &Url, value: &str) -> Result<()> {
+        let domain = url
+            .host_str()
+            .ok_or_else(|| Error::new("invalidData", "http.cookie-host"))?
+            .to_ascii_lowercase();
+        let path = "/".to_owned();
+        for pair in value.split(';') {
+            let (name, value) = pair
+                .split_once('=')
+                .ok_or_else(|| Error::new("invalidData", "http.cookie"))?;
+            let (name, value) = (name.trim(), value.trim());
+            if !valid_cookie_name(name) || !valid_cookie_value(value) {
+                return Err(Error::new("invalidData", "http.cookie"));
+            }
+            self.cookies.insert(
+                (domain.clone(), path.clone(), name.to_owned()),
+                StoredCookie {
+                    value: value.to_owned(),
+                    domain: domain.clone(),
+                    host_only: true,
+                    path: path.clone(),
+                    secure: url.scheme() == "https",
+                },
+            );
+        }
+        Ok(())
     }
     fn request(
         &mut self,
@@ -749,23 +920,21 @@ impl HttpClient {
         let mut method = method.to_owned();
         let mut body = body;
         let started = host.now_ms();
-        for redirect in 0..=3 {
-            let mut cookies = self.cookies.clone();
-            for (_, value) in headers
-                .iter()
-                .filter(|(name, _)| name.eq_ignore_ascii_case("cookie"))
-            {
-                for entry in value.split(';') {
-                    if let Some((name, value)) = entry.split_once('=') {
-                        cookies.insert(name.trim().into(), value.trim().into());
-                    }
-                }
-            }
+        let mut seen = BTreeSet::new();
+        seen.insert(url.to_string());
+        for (_, value) in headers
+            .iter()
+            .filter(|(name, _)| name.eq_ignore_ascii_case("cookie"))
+        {
+            self.set_explicit_cookie(&url, value)?;
+        }
+        loop {
+            let cookies = self.request_cookies(&url).collect::<Vec<_>>();
             let mut request_headers = headers
                 .iter()
                 .filter(|(name, _)| {
-                    !name.eq_ignore_ascii_case("cookie")
-                        && !(method == "GET" && name.eq_ignore_ascii_case("content-type"))
+                    !(name.eq_ignore_ascii_case("cookie")
+                        || method == "GET" && name.eq_ignore_ascii_case("content-type"))
                 })
                 .cloned()
                 .collect::<Vec<_>>();
@@ -779,53 +948,49 @@ impl HttpClient {
                         .join("; "),
                 ));
             }
-            let remaining =
-                (timeout_ms as u64).saturating_sub(host.now_ms().saturating_sub(started));
-            if remaining == 0 {
-                return Err(Error::new("deadlineExceeded", "http.deadline"));
-            }
+            let remaining = if timeout_ms == 0 {
+                0
+            } else {
+                let remaining =
+                    (timeout_ms as u64).saturating_sub(host.now_ms().saturating_sub(started));
+                if remaining == 0 {
+                    return Err(Error::new("deadlineExceeded", "http.deadline"));
+                }
+                remaining as u32
+            };
             let response = host.http(
                 &method,
                 url.as_str(),
                 request_headers,
                 body.clone(),
-                remaining as u32,
+                false,
+                remaining,
             )?;
             for (_, value) in response
                 .headers
                 .iter()
                 .filter(|(name, _)| name.eq_ignore_ascii_case("set-cookie"))
             {
-                if let Some((name, value)) = value.split(';').next().unwrap_or("").split_once('=') {
-                    if value.trim().is_empty() {
-                        self.cookies.remove(name.trim());
-                    } else {
-                        self.cookies.insert(name.trim().into(), value.trim().into());
-                    }
-                }
-            }
-            if self.cookies.len() > 128
-                || self
-                    .cookies
-                    .iter()
-                    .map(|(k, v)| k.len() + v.len())
-                    .sum::<usize>()
-                    > 65536
-            {
-                return Err(Error::new("invalidData", "http.cookie-size"));
+                self.set_cookie(&url, value)?;
             }
             let location = response
                 .headers
                 .iter()
                 .find(|(name, _)| name.eq_ignore_ascii_case("location"))
                 .map(|(_, value)| value);
-            if matches!(response.status, 301 | 302 | 303 | 307 | 308) && location.is_some() {
-                if redirect == 3 {
-                    return Err(Error::new("sourceUnavailable", "http.redirect-limit"));
-                }
+            if matches!(response.status, 301 | 302 | 303 | 307 | 308) {
+                let Some(location) = location else {
+                    return Ok(response);
+                };
                 url = url
-                    .join(location.unwrap())
+                    .join(location)
                     .map_err(|_| Error::new("invalidData", "http.redirect"))?;
+                if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+                    return Err(Error::new("invalidData", "http.redirect"));
+                }
+                if !seen.insert(url.to_string()) {
+                    return Err(Error::new("sourceUnavailable", "http.redirect-loop"));
+                }
                 if response.status == 303
                     || matches!(response.status, 301 | 302) && method == "POST"
                 {
@@ -846,6 +1011,5 @@ impl HttpClient {
             }
             return Ok(response);
         }
-        Err(Error::new("sourceUnavailable", "http.redirect-limit"))
     }
 }

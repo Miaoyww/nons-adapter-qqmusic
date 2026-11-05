@@ -25,9 +25,7 @@ const result = spawnSync(
 )
 assert.equal(result.status, 0, result.stderr)
 const { instantiate } = await import(pathToFileURL(resolve(output, 'adapter.component.js')).href)
-const { WASIShim } = await import(
-  pathToFileURL(resolve(tools, 'preview2-shim/dist/common/instantiation.js')).href
-)
+const { WASIShim } = await import(pathToFileURL(resolve(tools, 'preview2-shim/dist/common/instantiation.js')).href)
 const png = Buffer.from('89504e470d0a1a0a00000000', 'hex')
 const fixtureTrack = {
   mid: 'SongMID',
@@ -36,7 +34,12 @@ const fixtureTrack = {
   interval: 123,
   singer: [{ name: '歌手', mid: 'ArtistMID' }],
   album: { mid: 'AlbumMID', name: '专辑' },
-  file: { media_mid: 'AudioMID', size_128mp3: 4096, size_320mp3: 4096, size_flac: 4096 }
+  file: {
+    media_mid: 'AudioMID',
+    size_128mp3: 4096,
+    size_320mp3: 4096,
+    size_flac: 4096
+  }
 }
 function mqttPublish(type, payload = null) {
   const utf8 = (value) => {
@@ -62,6 +65,22 @@ function mqttPublish(type, payload = null) {
   ])
   return Buffer.concat([Buffer.from([0x30]), variable(body.length), body])
 }
+function mqttRedirect(reference) {
+  const variable = (value) => {
+    const bytes = []
+    do {
+      let b = value % 128
+      value = Math.floor(value / 128)
+      if (value) b |= 128
+      bytes.push(b)
+    } while (value)
+    return Buffer.from(bytes)
+  }
+  const bytes = Buffer.from(reference)
+  const properties = Buffer.concat([Buffer.from([0x1c, bytes.length >> 8, bytes.length & 255]), bytes])
+  const body = Buffer.concat([Buffer.from([0, 0x9c]), variable(properties.length), properties])
+  return Buffer.concat([Buffer.from([0x20]), variable(body.length), body])
+}
 const mqttCredentials = () =>
   mqttPublish('cookies', {
     cookies: {
@@ -78,10 +97,19 @@ async function component({
   rejectDesktopSearch = false,
   beforeSuback = [],
   afterSuback = [],
+  wsRedirects = 0,
+  wsReferences = [],
   resource = 'full',
+  streamFinalUrl = null,
+  playlistCover = 'https://y.gtimg.cn/playlist.jpg',
   flacSize = 4096,
   songDetail = fixtureTrack,
   playlistSongs = [fixtureTrack],
+  httpRedirections = 0,
+  httpRedirectLoop = false,
+  redirectCrossOrigin = false,
+  largeRedirectCookie = false,
+  expiresIn = 180,
   createdPlaylists = [
     {
       tid: 123,
@@ -94,10 +122,18 @@ async function component({
 } = {}) {
   const frames = [],
     requests = [],
+    eventTimeouts = [],
+    websocketTimeouts = [],
+    socketUrls = [],
     states = new Map(),
     sockets = new Set(),
     diagnostics = []
   let subscribed = false,
+    nextSocket = 1,
+    wsReferencesLeft = [...wsReferences],
+    wsRedirectsLeft = wsRedirects,
+    httpRedirectionsLeft = httpRedirections,
+    redirectCookie = largeRedirectCookie ? 'x'.repeat(70 * 1024) : '1',
     searchCalls = 0,
     confirmed = false,
     published = null,
@@ -106,6 +142,8 @@ async function component({
   const transport = {
     httpRequest(request) {
       requests.push(request)
+      assert.equal(typeof request.followRedirects, 'boolean')
+      assert.ok(request.timeoutMs >= 0)
       // Reproduces the real Host rule that rejected automatic Request framing.
       if (
         request.headers.some((header) =>
@@ -114,10 +152,45 @@ async function component({
       )
         throw 'framingDenied'
       const url = new URL(request.url)
+      if (httpRedirectionsLeft > 0 && ['open.weixin.qq.com', 'redirect.example'].includes(url.hostname)) {
+        const hop = Number(url.searchParams.get('redirect') ?? 0)
+        const cookie = request.headers.find((header) => header.name.toLowerCase() === 'cookie')
+        if (hop > 0 && !redirectCrossOrigin) assert.ok(cookie?.value.includes(`login_redirect=${redirectCookie}`))
+        if (hop > 0 && redirectCrossOrigin) assert.equal(cookie, undefined, 'source cookies stay on their host')
+        if (hop < httpRedirections) {
+          httpRedirectionsLeft--
+          const location = redirectCrossOrigin
+            ? new URL('https://redirect.example/connect/qrconnect')
+            : new URL(request.url)
+          if (!httpRedirectLoop) location.searchParams.set('redirect', String(hop + 1))
+          return {
+            url: request.url,
+            status: 302,
+            headers: [
+              { name: 'location', value: location.toString() },
+              ...(hop === 0
+                ? [
+                    {
+                      name: 'set-cookie',
+                      value: `login_redirect=${redirectCookie}; Path=/`
+                    }
+                  ]
+                : [])
+            ],
+            body: new Uint8Array()
+          }
+        }
+      }
       if (url.hostname.endsWith('.stream.qqmusic.qq.com'))
         return {
+          url: streamFinalUrl ?? request.url,
           status: resource === 'forbidden' ? 403 : 200,
-          headers: [{ name: 'content-length', value: resource === 'unknown' ? '3' : '4096' }],
+          headers: [
+            {
+              name: 'content-length',
+              value: resource === 'unknown' ? '3' : '4096'
+            }
+          ],
           body: new Uint8Array()
         }
       let body,
@@ -127,12 +200,23 @@ async function component({
           code: 0,
           data: {
             code: 0,
-            data: { q16: '1234567890123456', q36: '123456789012345678901234567890123456' }
+            data: {
+              q16: '1234567890123456',
+              q36: '123456789012345678901234567890123456'
+            }
           }
         }
-      else if (url.hostname === 'open.weixin.qq.com')
+      else if (url.hostname === 'open.weixin.qq.com' || url.hostname === 'redirect.example') {
+        if (url.pathname.includes('/qrcode/') && httpRedirections > 0)
+          assert.ok(
+            request.headers.some(
+              (header) =>
+                header.name.toLowerCase() === 'cookie' && header.value.includes(`login_redirect=${redirectCookie}`)
+            ),
+            'the image request reuses the redirect cookie jar'
+          )
         body = url.pathname.includes('/qrcode/') ? png : '<a href="?uuid=fakeUuid123">code</a>'
-      else if (url.hostname === 'lp.open.weixin.qq.com')
+      } else if (url.hostname === 'lp.open.weixin.qq.com')
         body = confirmed
           ? "window.wx_errcode=405;window.wx_code='fixture-code';"
           : "window.wx_errcode=408;window.wx_code='';"
@@ -162,10 +246,7 @@ async function component({
                                   : resource === 'lower-quality'
                                     ? 'M500AudioMID.mp3'
                                     : resource === 'canonical-file'
-                                      ? value.req_0.param.filename[0].replace(
-                                          'SongMIDAudioMID',
-                                          'AudioMID'
-                                        )
+                                      ? value.req_0.param.filename[0].replace('SongMIDAudioMID', 'AudioMID')
                                       : value.req_0.param.filename[0]
                         }
                       ]
@@ -202,7 +283,10 @@ async function component({
                             }
                           : method === 'GetLoginUserInfo'
                             ? {
-                                info: { nick: '测试账号', logo: 'https://thirdqq.qlogo.cn/avatar' }
+                                info: {
+                                  nick: '测试账号',
+                                  logo: 'https://avatar.example:9443/u/42.png?size=large'
+                                }
                               }
                             : method === 'GetSession'
                               ? {
@@ -215,7 +299,7 @@ async function component({
                               : {
                                   qrcodeID: 'fixture-qr',
                                   qrcode: png.toString('base64'),
-                                  expiresIn: 180
+                                  expiresIn
                                 }
             }
           }
@@ -251,7 +335,10 @@ async function component({
                           ),
                           total_song_num: playlistSongs.length
                         }
-                      : { body: { item_song: [fixtureTrack] }, meta: { sum: 1 } }
+                      : {
+                          body: { item_song: [fixtureTrack] },
+                          meta: { sum: 1 }
+                        }
             }
           }
       }
@@ -263,7 +350,7 @@ async function component({
             fixtureTrack,
             { singerMID: 'ArtistMID', singerName: 'Artist' },
             { albumMID: 'AlbumMID', albumName: 'Album' },
-            { dissid: 123, dissname: 'Playlist', imgurl: 'https://y.gtimg.cn/playlist.jpg' }
+            { dissid: 123, dissname: 'Playlist', imgurl: playlistCover }
           ]
           body = {
             code: 0,
@@ -294,31 +381,45 @@ async function component({
         body instanceof Uint8Array
           ? body
           : new TextEncoder().encode(typeof body === 'string' ? body : JSON.stringify(body))
-      return { status, headers: [{ name: 'content-type', value: 'application/json' }], body: bytes }
+      return {
+        url: request.url,
+        status,
+        headers: [{ name: 'content-type', value: 'application/json' }],
+        body: bytes
+      }
     },
     websocketOpen(url, protocol, timeoutMs) {
       assert.equal(protocol, 'mqtt')
-      assert.ok(
-        timeoutMs >= 1 && timeoutMs <= 15000,
-        'connection budget must satisfy the real Host contract'
-      )
-      sockets.add(1)
-      return 1
+      assert.ok(timeoutMs > 0 && timeoutMs <= 180_000, 'connection uses the remaining QR protocol deadline')
+      websocketTimeouts.push(timeoutMs)
+      socketUrls.push(url)
+      const socket = nextSocket++
+      sockets.add(socket)
+      return socket
     },
     websocketSend(socket, data) {
-      if (data[0] >> 4 === 1)
-        frames.push({ tag: 'binary', val: { socket, data: new Uint8Array([0x20, 3, 0, 0, 0]) } })
+      if (data[0] >> 4 === 1) {
+        if (wsReferencesLeft.length > 0 || wsRedirectsLeft > 0) {
+          const reference = wsReferencesLeft.shift() ?? `node${nextSocket}`
+          wsRedirectsLeft--
+          frames.push({
+            tag: 'binary',
+            val: { socket, data: mqttRedirect(reference) }
+          })
+        } else {
+          frames.push({
+            tag: 'binary',
+            val: { socket, data: new Uint8Array([0x20, 3, 0, 0, 0]) }
+          })
+        }
+      }
       if (data[0] >> 4 === 8) {
         subscribed = true
         frames.push({
           tag: 'binary',
           val: {
             socket,
-            data: Buffer.concat([
-              ...beforeSuback,
-              Buffer.from([0x90, 4, 0, 1, 0, 0]),
-              ...afterSuback
-            ])
+            data: Buffer.concat([...beforeSuback, Buffer.from([0x90, 4, 0, 1, 0, 0]), ...afterSuback])
           }
         })
       }
@@ -327,7 +428,8 @@ async function component({
       sockets.delete(socket)
     },
     nextEvent(timeoutMs) {
-      assert.ok(timeoutMs <= 1000, 'event wait must satisfy the real Host contract')
+      eventTimeouts.push(timeoutMs)
+      assert.ok(timeoutMs >= 0)
       return frames.shift()
     },
     credentialRead() {
@@ -338,15 +440,12 @@ async function component({
     },
     credentialPublish(metadata, data) {
       const record = JSON.parse(metadata)
-      assert.deepEqual(Object.keys(record.avatar).sort(), [
-        'exlarge',
-        'large',
-        'normal',
-        'original',
-        'small'
-      ])
-      assert.equal(record.avatar.original, 'https://thirdqq.qlogo.cn/avatar')
-      published = { record, credential: JSON.parse(new TextDecoder().decode(data)) }
+      assert.deepEqual(Object.keys(record.avatar).sort(), ['exlarge', 'large', 'normal', 'original', 'small'])
+      assert.equal(record.avatar.original, 'https://avatar.example:9443/u/42.png?size=large')
+      published = {
+        record,
+        credential: JSON.parse(new TextDecoder().decode(data))
+      }
     },
     credentialInvalidate() {
       invalidated = true
@@ -358,23 +457,23 @@ async function component({
       states.set(key, value)
     }
   }
-  const instance = await instantiate(
-    async (path) => WebAssembly.compile(await readFile(resolve(output, path))),
-    {
-      ...new WASIShim().getImportObject(),
-      'nons:host/transport': transport,
-      'nons:plugin/host': {
-        call(operation, args) {
-          diagnostics.push(JSON.parse(args))
-          return 'null'
-        }
+  const instance = await instantiate(async (path) => WebAssembly.compile(await readFile(resolve(output, path))), {
+    ...new WASIShim().getImportObject(),
+    'nons:host/transport': transport,
+    'nons:plugin/host': {
+      call(operation, args) {
+        diagnostics.push(JSON.parse(args))
+        return 'null'
       }
     }
-  )
+  })
   instance.initialize()
   return {
     instance,
     requests,
+    eventTimeouts,
+    websocketTimeouts,
+    socketUrls,
     states,
     sockets,
     subscribed: () => subscribed,
@@ -411,15 +510,13 @@ async function component({
           }
         })
       )
-      const body = Buffer.concat([
-        utf8('fixture-qr'),
-        variable(properties.length),
-        properties,
-        payload
-      ])
+      const body = Buffer.concat([utf8('fixture-qr'), variable(properties.length), properties, payload])
       frames.push({
         tag: 'binary',
-        val: { socket: 1, data: Buffer.concat([Buffer.from([0x30]), variable(body.length), body]) }
+        val: {
+          socket: 1,
+          data: Buffer.concat([Buffer.from([0x30]), variable(body.length), body])
+        }
       })
     },
     start(method) {
@@ -446,12 +543,116 @@ async function component({
       )
     },
     call(method, request) {
-      return JSON.parse(
-        instance.call(method, JSON.stringify({ session: { source: 'qqmusic' }, request }))
-      )
+      return JSON.parse(instance.call(method, JSON.stringify({ session: { source: 'qqmusic' }, request })))
     }
   }
 }
+
+test('WeChat login keeps Set-Cookie across more than three manual redirects', async () => {
+  const fixture = await component({ httpRedirections: 5 })
+  try {
+    const begin = fixture.start('wechat')
+    assert.equal(begin.status, 'ok', JSON.stringify(begin))
+    assert.equal(begin.data.data.image.startsWith('data:image/png;base64,'), true)
+    assert.ok(fixture.requests.length >= 7)
+    assert.ok(
+      fixture.requests
+        .filter((request) => new URL(request.url).searchParams.has('redirect'))
+        .every((request) =>
+          request.headers.some(
+            (header) => header.name.toLowerCase() === 'cookie' && header.value.includes('login_redirect=1')
+          )
+        )
+    )
+    assert.ok(
+      fixture.requests
+        .filter((request) => new URL(request.url).searchParams.has('redirect'))
+        .every((request) => request.followRedirects === false && request.timeoutMs > 0)
+    )
+  } finally {
+    fixture.instance.shutdown()
+  }
+})
+
+test('redirect cookies larger than 64KiB remain available', async () => {
+  const fixture = await component({
+    httpRedirections: 1,
+    largeRedirectCookie: true
+  })
+  try {
+    const begin = fixture.start('wechat')
+    assert.equal(begin.status, 'ok', JSON.stringify(begin))
+    const redirected = fixture.requests.find((request) => new URL(request.url).searchParams.has('redirect'))
+    assert.ok(redirected)
+    const cookie = redirected.headers.find((header) => header.name.toLowerCase() === 'cookie')
+    assert.ok(cookie.value.length > 64 * 1024)
+  } finally {
+    fixture.instance.shutdown()
+  }
+})
+
+test('manual redirects do not send source cookies to another host', async () => {
+  const fixture = await component({
+    httpRedirections: 1,
+    redirectCrossOrigin: true
+  })
+  try {
+    const begin = fixture.start('wechat')
+    assert.equal(begin.status, 'ok', JSON.stringify(begin))
+    const redirected = fixture.requests.find((request) => new URL(request.url).hostname === 'redirect.example')
+    assert.ok(redirected)
+    assert.ok(!redirected.headers.some((header) => header.name.toLowerCase() === 'cookie'))
+    const image = fixture.requests.find((request) => new URL(request.url).pathname.includes('/qrcode/'))
+    assert.ok(
+      image.headers.some(
+        (header) => header.name.toLowerCase() === 'cookie' && header.value.includes('login_redirect=1')
+      )
+    )
+  } finally {
+    fixture.instance.shutdown()
+  }
+})
+
+test('manual HTTP redirects stop on a URL loop', async () => {
+  const fixture = await component({ httpRedirections: 10, httpRedirectLoop: true })
+  try {
+    const begin = fixture.start('wechat')
+    assert.equal(begin.status, 'error')
+    assert.equal(begin.data.code, 'sourceUnavailable')
+    assert.equal(fixture.requests.filter((request) => new URL(request.url).pathname === '/connect/qrconnect').length, 1)
+    assert.ok(fixture.diagnostics.some((entry) => entry.stage === 'http.redirect-loop'))
+  } finally {
+    fixture.instance.shutdown()
+  }
+})
+
+test('QQ handshakes retain the QR protocol expiry instead of fixed transport deadlines', async () => {
+  const fixture = await component({ expiresIn: 1 })
+  try {
+    const begin = fixture.start('qq')
+    assert.equal(begin.status, 'ok', JSON.stringify(begin))
+    const create = fixture.requests.find((request) => {
+      try {
+        return new TextDecoder().decode(request.body).includes('CreateQRCode')
+      } catch {
+        return false
+      }
+    })
+    assert.ok(create.timeoutMs > 0 && create.timeoutMs <= 180_000)
+    assert.ok(fixture.websocketTimeouts.every((timeout) => timeout > 0 && timeout <= 1_000))
+    assert.ok(fixture.eventTimeouts.every((timeout) => timeout > 0 && timeout <= 1_000))
+    await new Promise((resolve) => setTimeout(resolve, 1_100))
+    const expired = fixture.call('music.account', {
+      operation: 'pollLogin',
+      key: begin.data.data.key
+    })
+    assert.equal(expired.data.data.code, 800)
+    assert.equal(fixture.sockets.size, 0)
+  } finally {
+    fixture.instance.shutdown()
+  }
+})
+
 test('actual Component search leaves Content-Length to Host and keeps stable mid', async () => {
   const fixture = await component()
   try {
@@ -466,6 +667,13 @@ test('actual Component search leaves Content-Length to Host and keeps stable mid
     const detail = fixture.call('music.read-track', response.data.data.items[0].reference)
     assert.equal(detail.status, 'ok')
     assert.equal(fixture.requests.length, 2)
+    for (const request of fixture.requests) {
+      assert.equal(request.method, 'POST')
+      assert.equal(request.followRedirects, true)
+      assert.equal(request.timeoutMs, 0)
+      assert.ok(request.body.length > 0)
+      assert.ok(request.headers.some((header) => header.name.toLowerCase() === 'content-type'))
+    }
   } catch (error) {
     try {
       fixture.instance.shutdown()
@@ -474,9 +682,108 @@ test('actual Component search leaves Content-Length to Host and keeps stable mid
   }
   fixture.instance.shutdown()
 })
+
+test('business replies larger than the old 64KiB transport limit', async () => {
+  const title = '长'.repeat(40_000)
+  const playlistSongs = Array.from({ length: 25 }, (_, index) => ({
+    ...fixtureTrack,
+    mid: `Long${index}`,
+    title,
+    album: { ...fixtureTrack.album, name: title },
+    singer: [{ name: title, mid: `Artist${index}` }]
+  }))
+  const fixture = await component({ playlistSongs })
+  try {
+    const raw = fixture.instance.call(
+      'music.business',
+      JSON.stringify({
+        session: { source: 'qqmusic' },
+        request: {
+          operation: 'tracks',
+          entity: { source: 'qqmusic', kind: 'playlist', id: '123' },
+          page: { cursor: null, limit: 25 }
+        }
+      })
+    )
+    const result = JSON.parse(raw)
+    assert.equal(result.status, 'ok', raw.slice(0, 200))
+    assert.ok(raw.length > 64 * 1024)
+    assert.equal(result.data.data.items.length, 25)
+  } finally {
+    fixture.instance.shutdown()
+  }
+})
+
+test('business arguments larger than the old 64KiB transport limit', async () => {
+  const fixture = await component()
+  try {
+    const args = JSON.stringify({
+      session: { source: 'qqmusic' },
+      request: {
+        operation: 'search',
+        kind: 'track',
+        keyword: '测'.repeat(1024 * 1024),
+        page: { limit: 5, cursor: null }
+      }
+    })
+    assert.ok(args.length > 64 * 1024)
+    const result = JSON.parse(fixture.instance.call('music.business', args))
+    assert.equal(result.status, 'ok', JSON.stringify(result))
+  } finally {
+    fixture.instance.shutdown()
+  }
+})
+
+test('independent component instances accept more than the old concurrency budget', async () => {
+  const fixtures = await Promise.all(Array.from({ length: 40 }, () => component()))
+  try {
+    const responses = await Promise.all(
+      fixtures.map((fixture) =>
+        Promise.resolve(
+          fixture.call('music.business', {
+            operation: 'search',
+            kind: 'track',
+            keyword: '并发',
+            page: { limit: 5, cursor: null }
+          })
+        )
+      )
+    )
+    for (const response of responses) {
+      assert.equal(response.status, 'ok', JSON.stringify(response))
+      assert.equal(response.data.data.items[0].reference.id, 'SongMID')
+    }
+  } finally {
+    await Promise.all(fixtures.map((fixture) => fixture.instance.shutdown()))
+  }
+})
+
+test('playlist covers keep private IP, port and URL credentials', async () => {
+  const cover = 'http://user:secret@127.0.0.1:8080/cover.jpg?size=large'
+  const fixture = await component({
+    searchRejections: 1,
+    playlistCover: cover
+  })
+  try {
+    const response = fixture.call('music.business', {
+      operation: 'search',
+      kind: 'playlist',
+      keyword: '测试',
+      page: { limit: 5, cursor: null }
+    })
+    assert.equal(response.status, 'ok', JSON.stringify(response))
+    assert.equal(response.data.data.items[0].cover.original, cover)
+  } finally {
+    fixture.instance.shutdown()
+  }
+})
+
 for (const searchFailureLevel of ['root', 'request'])
   test(`actual Component first search recovers upstream 2001 at ${searchFailureLevel} without waiting or reloading`, async () => {
-    const fixture = await component({ searchRejections: 1, searchFailureLevel })
+    const fixture = await component({
+      searchRejections: 1,
+      searchFailureLevel
+    })
     try {
       const request = {
         operation: 'search',
@@ -488,18 +795,14 @@ for (const searchFailureLevel of ['root', 'request'])
       assert.equal(response.status, 'ok', JSON.stringify(response))
       assert.equal(response.data.data.items[0].reference.id, 'SongMID')
       assert.equal(fixture.requests.length, 2)
-      const [first, retry] = fixture.requests.map((value) =>
-        JSON.parse(new TextDecoder().decode(value.body))
-      )
+      const [first, retry] = fixture.requests.map((value) => JSON.parse(new TextDecoder().decode(value.body)))
       assert.ok(first.comm)
       assert.equal(retry.comm, undefined)
       assert.equal(retry.request.method, 'DoSearchForQQMusicDesktop')
       for (const key of ['query', 'search_type', 'num_per_page', 'page_num'])
         assert.equal(retry.request.param[key], first.request.param[key])
       assert.ok(
-        fixture.diagnostics.some(
-          (value) => value.stage === 'search.retry-desktop' && value.code === 'upstream-2001'
-        )
+        fixture.diagnostics.some((value) => value.stage === 'search.retry-desktop' && value.code === 'upstream-2001')
       )
     } finally {
       fixture.instance.shutdown()
@@ -520,7 +823,10 @@ for (const [kind, expected] of [
         operation: 'search',
         kind,
         keyword: '烂泥',
-        page: { limit: 5, cursor: JSON.stringify({ scope, limit: 5, offset: 5 }) }
+        page: {
+          limit: 5,
+          cursor: JSON.stringify({ scope, limit: 5, offset: 5 })
+        }
       })
       assert.equal(response.status, 'ok', JSON.stringify(response))
       assert.equal(response.data.data.items[0].reference.id, expected)
@@ -567,19 +873,106 @@ test('QQ consumes a PUBLISH coalesced after SUBACK without waiting for another f
   try {
     const begin = fixture.start('qq')
     assert.equal(begin.status, 'ok')
+    fixture.eventTimeouts.length = 0
     const progress = fixture.call('music.account', {
       operation: 'pollLogin',
       key: begin.data.data.key
     })
     assert.equal(progress.status, 'ok')
     assert.equal(progress.data.data.code, 802)
+    assert.ok(
+      fixture.eventTimeouts.every((timeout) => timeout > 0 && timeout <= 1000),
+      'poll waits pass the remaining call budget to the Host'
+    )
+  } finally {
+    fixture.instance.shutdown()
+  }
+})
+
+test('QQ follows every bounded WebSocket broker handshake redirect on the same endpoint', async () => {
+  const fixture = await component({ wsRedirects: 3 })
+  try {
+    const begin = fixture.start('qq')
+    assert.equal(begin.status, 'ok', JSON.stringify(begin))
+    assert.equal(fixture.subscribed(), true)
+    assert.deepEqual(fixture.socketUrls, [
+      'wss://mu.y.qq.com/ws/handshake',
+      'wss://mu.y.qq.com/ws/handshake/node2',
+      'wss://mu.y.qq.com/ws/handshake/node2/node3',
+      'wss://mu.y.qq.com/ws/handshake/node2/node3/node4'
+    ])
+    assert.deepEqual([...fixture.sockets], [4])
+  } finally {
+    fixture.instance.shutdown()
+  }
+})
+
+for (const [name, reference] of [
+  ['absolute path', '/node'],
+  ['query', 'node?broker=1'],
+  ['backslash', 'node\\broker']
+])
+  test(`QQ rejects a WebSocket broker reference with an ${name}`, async () => {
+    const fixture = await component({ wsReferences: [reference] })
+    try {
+      const begin = fixture.start('qq')
+      assert.equal(begin.status, 'error')
+      assert.ok(
+        fixture.diagnostics.some((entry) => entry.stage === 'mqtt.redirect-reference'),
+        JSON.stringify(fixture.diagnostics)
+      )
+      assert.equal(fixture.socketUrls.length, 1)
+      assert.equal(fixture.sockets.size, 0)
+    } finally {
+      fixture.instance.shutdown()
+    }
+  })
+
+test('QQ accepts a WebSocket broker reference larger than the old detector cap', async () => {
+  const reference = 'r'.repeat(2048)
+  const fixture = await component({ wsReferences: [reference] })
+  try {
+    const begin = fixture.start('qq')
+    assert.equal(begin.status, 'ok', JSON.stringify(begin))
+    assert.equal(fixture.socketUrls.at(-1), `wss://mu.y.qq.com/ws/handshake/${reference}`)
+  } finally {
+    fixture.instance.shutdown()
+  }
+})
+
+test('QQ bounds WebSocket broker handshake redirects', async () => {
+  const fixture = await component({ wsRedirects: 4 })
+  try {
+    const begin = fixture.start('qq')
+    assert.equal(begin.status, 'error')
+    assert.equal(begin.data.code, 'sourceUnavailable')
+    assert.equal(fixture.socketUrls.length, 4)
+    assert.ok(
+      fixture.diagnostics.some((entry) => entry.stage === 'mqtt.redirect-limit'),
+      JSON.stringify(fixture.diagnostics)
+    )
+    assert.equal(fixture.sockets.size, 0)
+  } finally {
+    fixture.instance.shutdown()
+  }
+})
+
+test('QQ accepts a WebSocket publish larger than the old 64KiB buffer', async () => {
+  const fixture = await component({
+    afterSuback: [mqttPublish('waiting', { padding: 'x'.repeat(1024 * 1024) })]
+  })
+  try {
+    const begin = fixture.start('qq')
+    assert.equal(begin.status, 'ok', JSON.stringify(begin))
   } finally {
     fixture.instance.shutdown()
   }
 })
 
 test('QQ terminal confirmation ignores a later timeout queued before SUBACK', async () => {
-  const fixture = await component({ beforeSuback: [mqttCredentials(), mqttPublish('timeout')] })
+  const fixture = await component({
+    beforeSuback: [mqttCredentials(), mqttPublish('timeout')]
+  })
   try {
     const begin = fixture.start('qq')
     assert.equal(begin.status, 'ok')
@@ -603,7 +996,11 @@ test('QQ reconstructs a confirmation split across WebSocket frames', async () =>
     const packet = mqttCredentials()
     for (const bytes of [packet.subarray(0, 1), packet.subarray(1, 4)]) {
       assert.equal(
-        fixture.event({ kind: 'binary', socket: 1, data: bytes.toString('base64') }).status,
+        fixture.event({
+          kind: 'binary',
+          socket: 1,
+          data: bytes.toString('base64')
+        }).status,
         'ok'
       )
     }
@@ -614,8 +1011,11 @@ test('QQ reconstructs a confirmation split across WebSocket frames', async () =>
     assert.equal(waiting.data.data.code, 801)
     assert.equal(fixture.published(), null)
     assert.equal(
-      fixture.event({ kind: 'binary', socket: 1, data: packet.subarray(4).toString('base64') })
-        .status,
+      fixture.event({
+        kind: 'binary',
+        socket: 1,
+        data: packet.subarray(4).toString('base64')
+      }).status,
       'ok'
     )
     const progress = fixture.call('music.account', {
@@ -630,22 +1030,41 @@ test('QQ reconstructs a confirmation split across WebSocket frames', async () =>
   }
 })
 
-test('QQ rejects an excessive MQTT packet batch and releases the challenge transport', async () => {
+test('QQ queues more than 32 publishes before SUBACK without terminating login', async () => {
+  const fixture = await component({
+    beforeSuback: Array.from({ length: 40 }, () => mqttPublish('waiting'))
+  })
+  try {
+    const begin = fixture.start('qq')
+    assert.equal(begin.status, 'ok', JSON.stringify(begin))
+    assert.equal(fixture.subscribed(), true)
+    assert.equal(fixture.sockets.size, 1)
+    assert.equal(fixture.published(), null)
+  } finally {
+    fixture.instance.shutdown()
+  }
+})
+
+test('QQ accepts a coalesced MQTT packet batch larger than the poll quantum', async () => {
   const fixture = await component()
   try {
     const begin = fixture.start('qq')
     assert.equal(begin.status, 'ok')
     const batch = Buffer.from(Array.from({ length: 33 }, () => [0xd0, 0]).flat())
-    const event = fixture.event({ kind: 'binary', socket: 1, data: batch.toString('base64') })
+    const event = fixture.event({
+      kind: 'binary',
+      socket: 1,
+      data: batch.toString('base64')
+    })
     assert.equal(event.status, 'ok')
     const progress = fixture.call('music.account', {
       operation: 'pollLogin',
       key: begin.data.data.key
     })
-    assert.equal(progress.data.data.code, 800)
-    assert.equal(fixture.sockets.size, 0)
+    assert.equal(progress.data.data.code, 801)
+    assert.equal(fixture.sockets.size, 1)
     assert.equal(fixture.published(), null)
-    assert.ok(fixture.diagnostics.some((entry) => entry.stage === 'mqtt.event-count'))
+    assert.ok(!fixture.diagnostics.some((entry) => entry.code === 'rateLimited'))
   } finally {
     fixture.instance.shutdown()
   }
@@ -659,8 +1078,12 @@ for (const method of ['qq', 'wechat'])
       assert.equal(response.status, 'ok', JSON.stringify(response))
       assert.equal(response.data.type, 'challenge')
       assert.ok(response.data.data.image.startsWith('data:image/png;base64,'))
+      if (method === 'qq') assert.equal(fixture.subscribed(), true, 'QR cannot be shown before MQTT SUBACK')
       if (method === 'qq')
-        assert.equal(fixture.subscribed(), true, 'QR cannot be shown before MQTT SUBACK')
+        assert.ok(
+          fixture.eventTimeouts.every((timeout) => timeout > 0),
+          'MQTT handshakes retain the QR protocol deadline'
+        )
       const device = fixture.states.get('device')
       assert.ok(device)
       assert.ok(!device.includes('bootstrap-secret'))
@@ -709,7 +1132,10 @@ async function credentialFixture() {
     const begin = fixture.start('qq')
     fixture.confirm('qq')
     for (let i = 0; i < 5 && !fixture.published(); i++)
-      fixture.call('music.account', { operation: 'pollLogin', key: begin.data.data.key })
+      fixture.call('music.account', {
+        operation: 'pollLogin',
+        key: begin.data.data.key
+      })
     assert.ok(fixture.published())
     return fixture.published().credential
   } finally {
@@ -784,7 +1210,10 @@ test('playlist metadata is independent of malformed songs and track diagnostics 
   })
   try {
     const entity = { source: 'qqmusic', kind: 'playlist', id: '123' }
-    const detail = fixture.call('music.business', { operation: 'detail', entity })
+    const detail = fixture.call('music.business', {
+      operation: 'detail',
+      entity
+    })
     assert.equal(detail.status, 'ok')
     assert.equal(detail.data.data.item.name, 'Private playlist')
     const tracks = fixture.call('music.business', {
@@ -794,11 +1223,7 @@ test('playlist metadata is independent of malformed songs and track diagnostics 
     })
     assert.equal(tracks.status, 'error')
     assert.equal(tracks.data.code, 'invalidData')
-    assert.ok(
-      fixture.diagnostics.some(
-        (entry) => entry.stage === 'track.mid' && entry.class.includes('broken.title')
-      )
-    )
+    assert.ok(fixture.diagnostics.some((entry) => entry.stage === 'track.mid' && entry.class.includes('broken.title')))
     assert.ok(!JSON.stringify(fixture.diagnostics).includes('PRIVATE_METADATA'))
   } finally {
     fixture.instance.shutdown()
@@ -811,11 +1236,7 @@ test('playlist repairs missing MID by numeric song ID and retains unavailable so
     const fixture = await component({
       credential,
       songDetail,
-      playlistSongs: [
-        fixtureTrack,
-        { ...fixtureTrack, id: 99, mid: '', title: '下架曲目' },
-        fixtureTrack
-      ]
+      playlistSongs: [fixtureTrack, { ...fixtureTrack, id: 99, mid: '', title: '下架曲目' }, fixtureTrack]
     })
     try {
       const result = fixture.call('music.business', {
@@ -833,23 +1254,34 @@ test('playlist repairs missing MID by numeric song ID and retains unavailable so
         assert.equal(items[1].title, '下架曲目')
         assert.equal(items[1].unavailableReason, 'notFound')
         assert.ok(
-          fixture.diagnostics.some(
-            (entry) => entry.stage === 'track.mid-unavailable' && entry.code === 'notFound'
-          )
+          fixture.diagnostics.some((entry) => entry.stage === 'track.mid-unavailable' && entry.code === 'notFound')
         )
       }
       const requests = fixture.requests
         .filter((request) => request.body.length)
         .map((request) => JSON.parse(new TextDecoder().decode(request.body)))
       assert.ok(
-        requests.some(
-          (request) =>
-            request.request?.param?.song_id === 99 && request.request.param.song_mid === ''
-        )
+        requests.some((request) => request.request?.param?.song_id === 99 && request.request.param.song_mid === '')
       )
     } finally {
       fixture.instance.shutdown()
     }
+  }
+})
+
+test('manifest and descriptor use contract 2 without legacy network host lists', async () => {
+  const manifest = JSON.parse(await readFile(resolve(project, 'manifest.json'), 'utf8'))
+  assert.equal(manifest.descriptor.contractVersion, 2)
+  assert.ok(!('coverHosts' in manifest.descriptor))
+  assert.ok(!('httpHosts' in manifest.permissions))
+  assert.ok(!('websocketHosts' in manifest.permissions))
+  const fixture = await component()
+  try {
+    const descriptor = fixture.call('music.descriptor', null).data
+    assert.equal(descriptor.contractVersion, 2)
+    assert.ok(!('coverHosts' in descriptor))
+  } finally {
+    fixture.instance.shutdown()
   }
 })
 
@@ -864,6 +1296,8 @@ test('readonly favorites enumerate the liked playlist through favorites paging w
   })
   try {
     const descriptor = fixture.call('music.descriptor', null).data
+    assert.equal(descriptor.contractVersion, 2)
+    assert.ok(!('coverHosts' in descriptor))
     assert.ok(descriptor.capabilities.includes('favoritesRead'))
     assert.ok(!descriptor.capabilities.includes('favorites'))
     let cursor = null
@@ -918,14 +1352,31 @@ test('public playlists read bounded upstream pages and preserve cursor order', a
       fixture.requests.every(
         (request) =>
           request.method === 'POST' &&
-          JSON.parse(new TextDecoder().decode(request.body)).request.method ===
-            'uniform_get_Dissinfo'
+          JSON.parse(new TextDecoder().decode(request.body)).request.method === 'uniform_get_Dissinfo'
       )
     )
   } finally {
     fixture.instance.shutdown()
   }
 })
+test('HEAD redirect final URL becomes the delivered playback URL without a client redirect loop', async () => {
+  const credential = await credentialFixture()
+  const finalUrl = 'https://user:secret@edge.example:9443/music/F000AudioMID.flac?token=final'
+  const fixture = await component({ credential, streamFinalUrl: finalUrl })
+  try {
+    const result = fixture.call('music.resolve-playback', {
+      track: { source: 'qqmusic', kind: 'track', id: 'SongMID' },
+      preferredQuality: 'lossless',
+      allowDowngrade: false
+    })
+    assert.equal(result.status, 'ok', JSON.stringify(result))
+    assert.equal(result.data.url, finalUrl)
+    assert.equal(fixture.requests.filter((request) => request.method === 'HEAD').length, 1)
+  } finally {
+    fixture.instance.shutdown()
+  }
+})
+
 test('plaintext resources report actual quality and reject previews, unknown size and forbidden downgrade', async () => {
   const credential = await credentialFixture()
   const request = {
@@ -1004,7 +1455,10 @@ test('authorized plaintext links may use a canonical filename different from the
 })
 
 test('empty playback addresses preserve the upstream per-song result without logging credentials or URLs', async () => {
-  const fixture = await component({ credential: await credentialFixture(), resource: 'empty' })
+  const fixture = await component({
+    credential: await credentialFixture(),
+    resource: 'empty'
+  })
   try {
     const result = fixture.call('music.resolve-playback', {
       track: { source: 'qqmusic', kind: 'track', id: 'SongMID' },
@@ -1014,9 +1468,7 @@ test('empty playback addresses preserve the upstream per-song result without log
     assert.equal(result.status, 'error')
     assert.equal(result.data.code, 'sourceUnavailable')
     assert.ok(
-      fixture.diagnostics.some(
-        (entry) => entry.stage === 'playback.vkey-empty.M500' && entry.code === 'upstream-1000'
-      ),
+      fixture.diagnostics.some((entry) => entry.stage === 'playback.vkey-empty.M500' && entry.code === 'upstream-1000'),
       JSON.stringify(fixture.diagnostics)
     )
     assert.ok(!JSON.stringify(fixture.diagnostics).includes('fixture-sensitive-key'))
@@ -1035,7 +1487,10 @@ test('a disconnected QR channel fails explicitly and releases its transport', as
     assert.equal(event.status, 'ok')
     let result
     for (let i = 0; i < 5; i++) {
-      result = fixture.call('music.account', { operation: 'pollLogin', key: begin.data.data.key })
+      result = fixture.call('music.account', {
+        operation: 'pollLogin',
+        key: begin.data.data.key
+      })
       if (result.data?.data?.code === 800) break
     }
     assert.equal(result.data.data.code, 800)
@@ -1070,7 +1525,9 @@ test('library lists exclude the system likes directory before pagination but ret
       )
       assert.equal(result.data.data.nextCursor, null)
     }
-    const summary = fixture.call('music.business', { operation: 'librarySummary' })
+    const summary = fixture.call('music.business', {
+      operation: 'librarySummary'
+    })
     assert.equal(summary.status, 'ok', JSON.stringify(summary))
     assert.equal(summary.data.data.likedPlaylist.reference.id, 'liked')
   } finally {

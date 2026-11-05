@@ -11,17 +11,6 @@ use rand_core::SeedableRng;
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
-const MAX_INPUT: usize = 64 * 1024;
-fn bounded(values: &[&[u8]]) -> Result<()> {
-    if values
-        .iter()
-        .try_fold(0usize, |sum, value| sum.checked_add(value.len()))
-        .is_none_or(|size| size > MAX_INPUT)
-    {
-        return Err(Error::new("invalidData", "crypto.input-size"));
-    }
-    Ok(())
-}
 pub fn hex(data: &[u8]) -> String {
     const DIGITS: &[u8; 16] = b"0123456789abcdef";
     let mut value = String::with_capacity(data.len() * 2);
@@ -32,7 +21,7 @@ pub fn hex(data: &[u8]) -> String {
     value
 }
 pub fn decode_hex(value: &str) -> Result<Vec<u8>> {
-    if value.len() % 2 != 0 || !value.is_ascii() || value.len() > MAX_INPUT * 2 {
+    if !value.len().is_multiple_of(2) || !value.is_ascii() {
         return Err(Error::new("invalidData", "crypto.hex"));
     }
     value
@@ -56,9 +45,6 @@ pub fn b64(data: &[u8]) -> String {
     STANDARD.encode(data)
 }
 pub fn decode_b64(value: &str) -> Result<Vec<u8>> {
-    if value.len() > (MAX_INPUT + 2) / 3 * 4 {
-        return Err(Error::new("invalidData", "crypto.base64-size"));
-    }
     STANDARD
         .decode(value)
         .map_err(|_| Error::new("invalidData", "crypto.base64"))
@@ -70,7 +56,6 @@ pub fn sha256(data: &[u8]) -> Vec<u8> {
     Sha256::digest(data).to_vec()
 }
 pub fn hmac_sha256(key: &[u8], data: &[u8]) -> Result<Vec<u8>> {
-    bounded(&[key, data])?;
     let key = Zeroizing::new(key.to_vec());
     let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&key)
         .map_err(|_| Error::new("invalidData", "crypto.hmac-key"))?;
@@ -78,7 +63,6 @@ pub fn hmac_sha256(key: &[u8], data: &[u8]) -> Result<Vec<u8>> {
     Ok(mac.finalize().into_bytes().to_vec())
 }
 pub fn hkdf_sha256(key: &[u8], salt: &[u8], info: &[u8], length: usize) -> Result<Vec<u8>> {
-    bounded(&[key, salt, info])?;
     if length == 0 || length > 255 * 32 {
         return Err(Error::new("invalidData", "crypto.hkdf-length"));
     }
@@ -90,7 +74,6 @@ pub fn hkdf_sha256(key: &[u8], salt: &[u8], info: &[u8], length: usize) -> Resul
     Ok(output)
 }
 fn gcm(key: &[u8], nonce: &[u8], data: &[u8], aad: &[u8], decrypt: bool) -> Result<Vec<u8>> {
-    bounded(&[key, nonce, data, aad])?;
     if nonce.len() != 12 {
         return Err(Error::new("invalidData", "crypto.gcm-nonce"));
     }
@@ -122,7 +105,6 @@ pub fn aes_gcm_decrypt(key: &[u8], nonce: &[u8], data: &[u8], aad: &[u8]) -> Res
     gcm(key, nonce, data, aad, true)
 }
 fn cbc(key: &[u8], iv: &[u8], data: &[u8], decrypt: bool) -> Result<Vec<u8>> {
-    bounded(&[key, iv, data])?;
     if iv.len() != 16 {
         return Err(Error::new("invalidData", "crypto.cbc-iv"));
     }
@@ -159,7 +141,6 @@ pub fn rsaes_pkcs1_encrypt(
     exponent: u32,
     data: &[u8],
 ) -> Result<Vec<u8>> {
-    bounded(&[modulus, data])?;
     if !(128..=512).contains(&modulus.len()) || data.len() > modulus.len().saturating_sub(11) {
         return Err(Error::new("invalidData", "crypto.rsa-parameters"));
     }
